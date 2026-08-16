@@ -1,0 +1,22 @@
+[package]
+name = "abe-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "secure-abe"
+path = "src/main.rs"
+
+[dependencies]
+abe-core = { path = "../core" }
+abe-policy = { path = "../policy" }
+abe-authorities = { path = "../authorities" }
+abe-envelope = { path = "../envelope" }
+abe-storage = { path = "../storage" }
+abe-revocation = { path = "../revocation" }
+abe-audit = { path = "../audit" }
+clap = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,120 @@
+//! Hybrid encryption layer. Large payloads are never touched by the
+//! pairing-based ABE layer directly: a random 256-bit data-encryption
+//! key (DEK) encrypts the payload with AES-256-GCM, and only that small
+//! DEK is wrapped under the access-tree policy via `abe_core`.
+
+use abe_core::{decrypt_key, encrypt_key, AbeCiphertext, AccessTree, PublicParams};
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use rand_core::{CryptoRng, RngCore};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum EnvelopeError {
+    #[error("data-key wrapping failed: {0}")]
+    KeyWrap(#[from] abe_core::AbeError),
+    #[error("file encryption failed: {0}")]
+    FileCrypto(String),
+}
+
+/// A self-contained encrypted document: the AES-GCM ciphertext of the
+/// original bytes plus the ABE-wrapped key needed to open it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealedDocument {
+    pub file_nonce: [u8; 12],
+    pub file_ciphertext: Vec<u8>,
+    pub policy_summary: String,
+}
+
+/// Everything needed to store and later decrypt a document: the sealed
+/// bytes plus the ABE ciphertext wrapping the DEK. Kept as two pieces so
+/// callers can serialize them independently if desired.
+pub struct EncryptedPackage {
+    pub sealed: SealedDocument,
+    pub key_ciphertext: AbeCiphertext,
+}
+
+pub fn seal<R: RngCore + CryptoRng>(
+    pp: &PublicParams,
+    plaintext: &[u8],
+    tree: &AccessTree,
+    policy_summary: &str,
+    rng: &mut R,
+) -> Result<EncryptedPackage, EnvelopeError> {
+    let mut dek = [0u8; 32];
+    rng.fill_bytes(&mut dek);
+
+    let cipher = Aes256Gcm::new_from_slice(&dek)
+        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
+    let mut file_nonce = [0u8; 12];
+    rng.fill_bytes(&mut file_nonce);
+    let nonce = Nonce::from_slice(&file_nonce);
+    let file_ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
+
+    let key_ciphertext = encrypt_key(pp, &dek, tree, rng)?;
+
+    Ok(EncryptedPackage {
+        sealed: SealedDocument {
+            file_nonce,
+            file_ciphertext,
+            policy_summary: policy_summary.to_string(),
+        },
+        key_ciphertext,
+    })
+}
+
+pub fn open(
+    pp: &PublicParams,
+    usk: &abe_core::UserSecretKey,
+    package: &EncryptedPackage,
+) -> Result<Vec<u8>, EnvelopeError> {
+    let dek = decrypt_key(pp, usk, &package.key_ciphertext)?;
+    let cipher = Aes256Gcm::new_from_slice(&dek)
+        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
+    let nonce = Nonce::from_slice(&package.sealed.file_nonce);
+    cipher
+        .decrypt(nonce, package.sealed.file_ciphertext.as_slice())
+        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abe_core::{keygen, register_attribute, setup};
+
+    #[test]
+    fn round_trips_a_document() {
+        let mut rng = rand::thread_rng();
+        let (mut pp, msk) = setup(&mut rng);
+        register_attribute(&mut pp, "department=security", &mut rng);
+        register_attribute(&mut pp, "clearance>=4", &mut rng);
+
+        let usk = keygen(
+            &pp,
+            &msk,
+            "ali",
+            &["department=security".into(), "clearance>=4".into()],
+            &mut rng,
+        )
+        .unwrap();
+
+        let tree = AccessTree::and(vec![
+            AccessTree::leaf("department=security"),
+            AccessTree::leaf("clearance>=4"),
+        ]);
+        let pkg = seal(
+            &pp,
+            b"top secret incident report",
+            &tree,
+            "department=security AND clearance>=4",
+            &mut rng,
+        )
+        .unwrap();
+
+        let opened = open(&pp, &usk, &pkg).unwrap();
+        assert_eq!(opened, b"top secret incident report");
+    }
+}

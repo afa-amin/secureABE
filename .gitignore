@@ -1,0 +1,4 @@
+/data
+/target
+Cargo.lock.bak
+*.pdb

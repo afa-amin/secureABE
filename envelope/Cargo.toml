@@ -1,0 +1,12 @@
+[package]
+name = "abe-envelope"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abe-core = { path = "../core" }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

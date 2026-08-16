@@ -1,0 +1,13 @@
+[package]
+name = "abe-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abe-core = { path = "../core" }
+abe-envelope = { path = "../envelope" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }

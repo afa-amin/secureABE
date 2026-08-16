@@ -1,0 +1,12 @@
+[package]
+name = "abe-authorities"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abe-core = { path = "../core" }
+abe-audit = { path = "../audit" }
+rand = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
