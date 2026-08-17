@@ -74,16 +74,24 @@ struct PublicParamsDto {
     attributes: HashMap<String, AttrCommitmentDto>,
 }
 
+/// Renders a `Gt` element as a hex string for **display/audit purposes
+/// only** -- e.g. so `public_params_to_json`'s human-readable export has
+/// something to show for `egg_alpha` instead of omitting the field.
+///
+/// This delegates to `crate::scheme::gt_canonical_bytes`, the single
+/// place in this codebase that reads a `Gt`'s bytes through its
+/// `Debug`/`Display` impl (see that function's extensive doc comment
+/// for exactly why, and what pins the risk down). Sharing that one
+/// function keeps this file and `scheme.rs`'s KDF from ever drifting
+/// into two different, inconsistent ideas of "the bytes of a `Gt`".
+///
+/// Callers must not treat this hex string as parseable: there is no
+/// `gt_from_hex`, deliberately. `PublicParams` round-tripping never
+/// reconstructs `egg_alpha` from this string -- it is recomputed from
+/// `alpha` instead (see `setup_bundle_from_json`), which is the only
+/// sound way to get a working `Gt` value back.
 fn gt_to_hex(gt: &bls12_381::Gt) -> String {
-    // Gt has no canonical compressed encoding upstream; its Debug
-    // output is a deterministic hex dump of every underlying Fp limb,
-    // which is sufficient for our purposes (round-tripping our own
-    // values, and as KDF input in `scheme.rs`). It cannot be parsed
-    // back into a `Gt`, so PublicParams round-tripping stores it only
-    // for display/audit purposes and callers must not rely on
-    // reconstructing `egg_alpha` from this string; the field is
-    // recomputed instead (see `public_params_from_json`).
-    format!("{:?}", gt)
+    hex::encode(crate::scheme::gt_canonical_bytes(gt))
 }
 
 pub fn public_params_to_json(pp: &PublicParams) -> String {

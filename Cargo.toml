@@ -32,4 +32,4 @@ thiserror = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
-zeroize = "1"
+zeroize = { version = "=1.7", features = ["derive"] }

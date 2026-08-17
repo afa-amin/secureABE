@@ -9,6 +9,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 #[derive(Debug, Error)]
 pub enum EnvelopeError {
@@ -45,25 +46,30 @@ pub fn seal<R: RngCore + CryptoRng>(
     let mut dek = [0u8; 32];
     rng.fill_bytes(&mut dek);
 
-    let cipher = Aes256Gcm::new_from_slice(&dek)
-        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
-    let mut file_nonce = [0u8; 12];
-    rng.fill_bytes(&mut file_nonce);
-    let nonce = Nonce::from_slice(&file_nonce);
-    let file_ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
+    let result = (|| -> Result<EncryptedPackage, EnvelopeError> {
+        let cipher = Aes256Gcm::new_from_slice(&dek)
+            .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
+        let mut file_nonce = [0u8; 12];
+        rng.fill_bytes(&mut file_nonce);
+        let nonce = Nonce::from_slice(&file_nonce);
+        let file_ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
 
-    let key_ciphertext = encrypt_key(pp, &dek, tree, rng)?;
+        let key_ciphertext = encrypt_key(pp, &dek, tree, rng)?;
 
-    Ok(EncryptedPackage {
-        sealed: SealedDocument {
-            file_nonce,
-            file_ciphertext,
-            policy_summary: policy_summary.to_string(),
-        },
-        key_ciphertext,
-    })
+        Ok(EncryptedPackage {
+            sealed: SealedDocument {
+                file_nonce,
+                file_ciphertext,
+                policy_summary: policy_summary.to_string(),
+            },
+            key_ciphertext,
+        })
+    })();
+
+    dek.zeroize();
+    result
 }
 
 pub fn open(
@@ -71,13 +77,18 @@ pub fn open(
     usk: &abe_core::UserSecretKey,
     package: &EncryptedPackage,
 ) -> Result<Vec<u8>, EnvelopeError> {
-    let dek = decrypt_key(pp, usk, &package.key_ciphertext)?;
-    let cipher = Aes256Gcm::new_from_slice(&dek)
-        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
-    let nonce = Nonce::from_slice(&package.sealed.file_nonce);
-    cipher
-        .decrypt(nonce, package.sealed.file_ciphertext.as_slice())
-        .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))
+    let mut dek = decrypt_key(pp, usk, &package.key_ciphertext)?;
+    let result = (|| -> Result<Vec<u8>, EnvelopeError> {
+        let cipher = Aes256Gcm::new_from_slice(&dek)
+            .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
+        let nonce = Nonce::from_slice(&package.sealed.file_nonce);
+        cipher
+            .decrypt(nonce, package.sealed.file_ciphertext.as_slice())
+            .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))
+    })();
+
+    dek.zeroize();
+    result
 }
 
 #[cfg(test)]
