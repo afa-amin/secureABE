@@ -35,7 +35,7 @@ use crate::keys::{
 };
 use crate::share::{recombine, share_secret, LeafResult};
 use abe_policy::AccessTree;
-use aes_gcm::aead::{Aead, KeyInit, OsRng as AesOsRng};
+use aes_gcm::aead::{Aead, KeyInit, OsRng as AesOsRng, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use bls12_381::{pairing, G1Affine, G1Projective, G2Affine, G2Projective, Scalar};
 use ff::Field;
@@ -232,6 +232,31 @@ fn kdf(gt: &bls12_381::Gt) -> [u8; 32] {
     okm
 }
 
+/// Domain separator for the AES-256-GCM AAD that authenticates the
+/// access tree bound to a DEK wrap. Changing this label (or the tree
+/// encoding below) is a breaking change for existing ciphertexts.
+const DEK_WRAP_AAD_DOMAIN: &[u8] = b"SECURE_ABE_DEK_WRAP_v1";
+
+/// Builds the Additional Authenticated Data used when wrapping /
+/// unwrapping a DEK under AES-256-GCM.
+///
+/// Layout: `SECURE_ABE_DEK_WRAP_v1 || serde_json(AccessTree)`.
+///
+/// Binding the access tree into the AEAD tag means a ciphertext whose
+/// tree metadata was swapped for a different policy cannot successfully
+/// unwrap the DEK, even if the attacker somehow obtained a valid
+/// pairing-derived key for the *original* tree. `AccessTree` contains
+/// only strings and nested vectors (no maps), so `serde_json::to_vec`
+/// produces a deterministic encoding for a given tree.
+fn dek_wrap_aad(tree: &AccessTree) -> Result<Vec<u8>, AbeError> {
+    let tree_bytes = serde_json::to_vec(tree)
+        .map_err(|e| AbeError::Encoding(format!("access tree AAD serialization failed: {e}")))?;
+    let mut aad = Vec::with_capacity(DEK_WRAP_AAD_DOMAIN.len() + tree_bytes.len());
+    aad.extend_from_slice(DEK_WRAP_AAD_DOMAIN);
+    aad.extend_from_slice(&tree_bytes);
+    Ok(aad)
+}
+
 /// Encrypts a 32-byte data-encryption key (DEK) under an access tree.
 /// The returned ciphertext can only be opened by a user secret key
 /// whose attribute set satisfies `tree`.
@@ -276,7 +301,9 @@ pub fn encrypt_key<R: RngCore + CryptoRng>(
     // Scope the AES-GCM key material tightly so `key_bytes` can be
     // zeroized immediately after its only use (constructing the
     // cipher, which copies it internally) regardless of which branch
-    // below returns.
+    // below returns. The access tree is bound as AAD so a ciphertext
+    // whose tree metadata is later swapped cannot unwrap the DEK.
+    let aad = dek_wrap_aad(tree)?;
     let result = (|| {
         let cipher = Aes256Gcm::new_from_slice(&key_bytes)
             .map_err(|e| AbeError::Encoding(e.to_string()))?;
@@ -284,7 +311,13 @@ pub fn encrypt_key<R: RngCore + CryptoRng>(
         AesOsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, dek.as_slice())
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: dek.as_slice(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| AbeError::Encoding(e.to_string()))?;
         Ok((nonce_bytes, ciphertext))
     })();
@@ -336,12 +369,22 @@ pub fn decrypt_key(
     let mut key_bytes = kdf(&blinding);
     blinding.zeroize();
 
+    // Recompute the same AAD that encrypt_key bound; any mismatch
+    // (including a swapped access tree on the ciphertext) causes the
+    // AEAD tag check to fail and surfaces as PolicyNotSatisfied.
+    let aad = dek_wrap_aad(&ct.tree)?;
     let result = (|| {
         let cipher = Aes256Gcm::new_from_slice(&key_bytes)
             .map_err(|e| AbeError::Encoding(e.to_string()))?;
         let nonce = Nonce::from_slice(&ct.wrapped_key.nonce);
         cipher
-            .decrypt(nonce, ct.wrapped_key.ciphertext.as_slice())
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct.wrapped_key.ciphertext.as_slice(),
+                    aad: &aad,
+                },
+            )
             .map_err(|_| AbeError::PolicyNotSatisfied)
     })();
     key_bytes.zeroize();
@@ -532,5 +575,33 @@ mod tests {
         let dek = [5u8; 32];
         let ct = encrypt_key(&pp, &dek, &tree, &mut rng).unwrap();
         assert_eq!(dek, decrypt_key(&pp, &admin, &ct).unwrap());
+    }
+
+    /// Swapping the access tree on an otherwise-valid ciphertext must
+    /// cause DEK unwrap to fail, because the tree is bound as AAD to the
+    /// AES-GCM tag. Without AAD this would be a silent policy-substitution
+    /// attack if the attacker also held a key satisfying the *new* tree.
+    #[test]
+    fn swapped_access_tree_fails_aad() {
+        let mut rng = rand::thread_rng();
+        let (pp, msk) = setup_with_attrs(&[
+            "department=security",
+            "clearance>=4",
+            "role=admin",
+        ]);
+        let admin = keygen(&pp, &msk, "admin1", &["role=admin".into()], &mut rng).unwrap();
+
+        let original_tree = AccessTree::leaf("role=admin");
+        let dek = [11u8; 32];
+        let mut ct = encrypt_key(&pp, &dek, &original_tree, &mut rng).unwrap();
+
+        // Attacker replaces the tree metadata with a different policy.
+        // The pairing-side material still matches `role=admin`, but the
+        // AEAD AAD no longer matches, so unwrap must fail.
+        ct.tree = AccessTree::and(vec![
+            AccessTree::leaf("department=security"),
+            AccessTree::leaf("clearance>=4"),
+        ]);
+        assert!(decrypt_key(&pp, &admin, &ct).is_err());
     }
 }

@@ -33,3 +33,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 zeroize = { version = "=1.7", features = ["derive"] }
+zeroize_derive = "=1.4"

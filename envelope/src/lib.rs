@@ -4,12 +4,27 @@
 //! DEK is wrapped under the access-tree policy via `abe_core`.
 
 use abe_core::{decrypt_key, encrypt_key, AbeCiphertext, AccessTree, PublicParams};
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
+
+/// Domain separator for the file-level AES-256-GCM AAD that authenticates
+/// the human-readable policy summary stored alongside the ciphertext.
+const FILE_AAD_DOMAIN: &[u8] = b"SECURE_ABE_FILE_v1";
+
+/// Builds AAD for the payload AEAD: `SECURE_ABE_FILE_v1 || policy_summary`.
+/// Binding the policy summary into the tag means an attacker who edits
+/// `sealed.json` to change the displayed policy cannot still open the
+/// file under the original DEK.
+fn file_aad(policy_summary: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(FILE_AAD_DOMAIN.len() + policy_summary.len());
+    aad.extend_from_slice(FILE_AAD_DOMAIN);
+    aad.extend_from_slice(policy_summary.as_bytes());
+    aad
+}
 
 #[derive(Debug, Error)]
 pub enum EnvelopeError {
@@ -46,6 +61,7 @@ pub fn seal<R: RngCore + CryptoRng>(
     let mut dek = [0u8; 32];
     rng.fill_bytes(&mut dek);
 
+    let aad = file_aad(policy_summary);
     let result = (|| -> Result<EncryptedPackage, EnvelopeError> {
         let cipher = Aes256Gcm::new_from_slice(&dek)
             .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
@@ -53,7 +69,13 @@ pub fn seal<R: RngCore + CryptoRng>(
         rng.fill_bytes(&mut file_nonce);
         let nonce = Nonce::from_slice(&file_nonce);
         let file_ciphertext = cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
             .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
 
         let key_ciphertext = encrypt_key(pp, &dek, tree, rng)?;
@@ -78,12 +100,19 @@ pub fn open(
     package: &EncryptedPackage,
 ) -> Result<Vec<u8>, EnvelopeError> {
     let mut dek = decrypt_key(pp, usk, &package.key_ciphertext)?;
+    let aad = file_aad(&package.sealed.policy_summary);
     let result = (|| -> Result<Vec<u8>, EnvelopeError> {
         let cipher = Aes256Gcm::new_from_slice(&dek)
             .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))?;
         let nonce = Nonce::from_slice(&package.sealed.file_nonce);
         cipher
-            .decrypt(nonce, package.sealed.file_ciphertext.as_slice())
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: package.sealed.file_ciphertext.as_slice(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| EnvelopeError::FileCrypto(e.to_string()))
     })();
 
@@ -127,5 +156,41 @@ mod tests {
 
         let opened = open(&pp, &usk, &pkg).unwrap();
         assert_eq!(opened, b"top secret incident report");
+    }
+
+    /// Editing the stored policy_summary must cause file decryption to
+    /// fail, because the summary is bound as AAD to the AES-GCM tag.
+    #[test]
+    fn tampered_policy_summary_fails_aad() {
+        let mut rng = rand::thread_rng();
+        let (mut pp, msk) = setup(&mut rng);
+        register_attribute(&mut pp, "department=security", &mut rng);
+        register_attribute(&mut pp, "clearance>=4", &mut rng);
+
+        let usk = keygen(
+            &pp,
+            &msk,
+            "ali",
+            &["department=security".into(), "clearance>=4".into()],
+            &mut rng,
+        )
+        .unwrap();
+
+        let tree = AccessTree::and(vec![
+            AccessTree::leaf("department=security"),
+            AccessTree::leaf("clearance>=4"),
+        ]);
+        let mut pkg = seal(
+            &pp,
+            b"top secret incident report",
+            &tree,
+            "department=security AND clearance>=4",
+            &mut rng,
+        )
+        .unwrap();
+
+        // Attacker changes the human-readable policy metadata in storage.
+        pkg.sealed.policy_summary = "role=admin".to_string();
+        assert!(open(&pp, &usk, &pkg).is_err());
     }
 }

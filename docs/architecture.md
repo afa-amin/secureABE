@@ -95,6 +95,20 @@ DEK is ever wrapped by the CP-ABE layer. This keeps pairing operations off
 the hot path for large payloads, exactly as described in the design brief
 this project is based on.
 
+Both AES-256-GCM layers bind **Additional Authenticated Data (AAD)**:
+
+- **File AEAD** (`envelope`): AAD = `SECURE_ABE_FILE_v1 || policy_summary`
+  so tampering with the stored human-readable policy summary fails the
+  authentication tag.
+- **DEK-wrap AEAD** (`core::encrypt_key` / `decrypt_key`): AAD =
+  `SECURE_ABE_DEK_WRAP_v1 || serde_json(AccessTree)` so swapping the
+  access-tree metadata on a ciphertext cannot successfully unwrap the
+  DEK even if pairing material would otherwise allow it.
+
+Changing either domain label or the tree encoding is a breaking change
+for existing ciphertexts (still acceptable at 0.1.0 before a versioned
+serialization format exists).
+
 ## Storage (`storage`)
 
 Filesystem-backed package store: `sealed.json` (AES-GCM ciphertext + nonce +
